@@ -1,0 +1,16 @@
+train:
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_1/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_2/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_3/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_4/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_5/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/train_6/images
+val:
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/val_1/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/val_2/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/val_3/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/val_5/images
+  - C:/Users/jhasa/OneDrive/Desktop/TF detection/val_6/images
+
+nc: 2
+names: ['red', 'green']
