@@ -1,12 +1,11 @@
-from flask import Flask, request, render_template_string, Response, jsonify
+from flask import Flask, request, render_template_string, Response
 import RPi.GPIO as GPIO
 import time
 import threading
 import atexit
-import json
 import cv2
 import numpy as np
-from libcamera import Transform
+
 
 app = Flask(__name__)
 
@@ -14,12 +13,19 @@ app = Flask(__name__)
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-# Motor pin definitions
+# Pin definitions
 IN1, IN2, IN3, IN4 = 17, 27, 23, 24
 ENA, ENB = 18, 13
 
+# Ultrasonic sensor (HC-SR04) pins
+ULTRA_TRIG = 22   # Physical pin 15
+ULTRA_ECHO = 5    # Physical pin 29
+
 GPIO.setup([IN1, IN2, IN3, IN4], GPIO.OUT)
 GPIO.setup([ENA, ENB], GPIO.OUT)
+GPIO.setup(ULTRA_TRIG, GPIO.OUT)
+GPIO.setup(ULTRA_ECHO, GPIO.IN)
+GPIO.output(ULTRA_TRIG, False)
 
 pwmA = GPIO.PWM(ENA, 1000)
 pwmB = GPIO.PWM(ENB, 1000)
@@ -27,38 +33,16 @@ pwmB = GPIO.PWM(ENB, 1000)
 pwmA.start(0)
 pwmB.start(0)
 
-# ================= ULTRASONIC SENSOR SETUP (HC-SR04) =================
-# Change these pin numbers to match your wiring
-ULTRA_TRIG = 22   # GPIO pin connected to HC-SR04 TRIG
-ULTRA_ECHO = 5    # GPIO pin connected to HC-SR04 ECHO
-
-GPIO.setup(ULTRA_TRIG, GPIO.OUT)
-GPIO.setup(ULTRA_ECHO, GPIO.IN)
-GPIO.output(ULTRA_TRIG, GPIO.LOW)
-time.sleep(0.05)  # Let sensor settle on startup
-
-try:
-    # Fire one test pulse to confirm the sensor is wired and responding
-    GPIO.output(ULTRA_TRIG, GPIO.HIGH)
-    time.sleep(0.00001)
-    GPIO.output(ULTRA_TRIG, GPIO.LOW)
-    _t = time.time() + 0.1
-    while GPIO.input(ULTRA_ECHO) == 0 and time.time() < _t:
-        pass
-    _t = time.time() + 0.1
-    while GPIO.input(ULTRA_ECHO) == 1 and time.time() < _t:
-        pass
-    ultrasonic_ready = True
-    print("[ULTRA] HC-SR04 initialized OK")
-except Exception as _e:
-    print(f"[ULTRA] HC-SR04 init warning: {_e}")
-    ultrasonic_ready = True  # Still attempt reads; individual failures are handled in the loop
+# ================= ULTRASONIC SENSOR (HC-SR04) =================
+print("[ULTRA] HC-SR04 sensor ready on TRIG=GPIO22, ECHO=GPIO5")
+ultrasonic_ready = True
 
 # ================= MOTOR CALIBRATION =================
 # Right motor (OUT3/OUT4, pwmB) runs ~2V higher than left motor.
 # Scale down right-side PWM to compensate and prevent rightward drift.
 # Decrease this value if car still drifts right; increase toward 1.0 if it drifts left.
-RIGHT_MOTOR_SCALE = 0.85
+RIGHT_MOTOR_SCALE = 0.95
+LEFT_MOTOR_SCALE = 0.85
 
 # ================= STATE =================
 currentSpeed = 70
@@ -67,7 +51,7 @@ joystickSteering = 0
 
 tofObstacleDetection = False
 tofDistance = 9999  # mm
-TOF_STOP_DISTANCE = 200  # mm — stop if obstacle closer than this
+TOF_STOP_DISTANCE = 300  # mm — stop if obstacle closer than this
 
 # ================= TRAFFIC LIGHT DETECTION STATE =================
 trafficDetectionActive = False
@@ -94,8 +78,8 @@ picam2 = None
 # Separate frames: capture (for detection) and display (for stream)
 capture_frame = None   # Always the latest clean camera frame
 display_frame = None   # What the stream shows (may have detection boxes)
-latest_detections = []  # Bounding boxes from the last YOLO inference
 frame_lock = threading.Lock()
+current_detections = [] # Stores latest YOLO boxes to draw without lagging the stream
 
 def load_model():
     """Load ONNX model with OpenCV DNN."""
@@ -105,67 +89,115 @@ def load_model():
         net = cv2.dnn.readNetFromONNX(MODEL_PATH)
         net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+        cv2.setNumThreads(4)  # Force use of all 4 CPU cores on the Raspberry Pi
         print("[TF] Model loaded OK")
 
 def start_camera():
-    """Start Pi Camera with correct color + 180° rotation."""
-    global picam2
+    """Start Pi Camera — RGB888 format for correct OpenCV colors.
 
+    CRITICAL: Picamera2 / libcamera use DRM naming conventions where the
+    format names are COUNTER-INTUITIVE:
+        'RGB888' → actual memory byte order is B,G,R  (what OpenCV needs!)
+        'BGR888' → actual memory byte order is R,G,B  (WRONG for OpenCV!)
+
+    Using 'BGR888' causes a red/blue channel swap that appears as a
+    persistent pink or blue tint in the video stream.  'RGB888' is
+    the correct choice for direct OpenCV use with no cvtColor needed.
+    """
+    global picam2
     if picam2 is None:
         from picamera2 import Picamera2
-
         print("[CAM] Starting camera...")
         picam2 = Picamera2()
 
+        # 'RGB888' in Picamera2/libcamera DRM naming = BGR byte order in memory
+        # = exactly what OpenCV expects.  Do NOT use 'BGR888' — despite the
+        # name, it outputs R,G,B byte order which swaps red/blue in OpenCV.
         config = picam2.create_video_configuration(
-            main={"size": (640, 480), "format": "RGB888"},
-            transform=Transform(hflip=1, vflip=1),  # Rotate 180°
+            main={"size": (320, 240), "format": "RGB888"},
             controls={
                 "AwbEnable": True,
                 "AeEnable": True,
             }
         )
-
         picam2.configure(config)
         picam2.start()
-
-        time.sleep(2)
+        print("[CAM] Waiting for AWB/AE to settle...")
+        time.sleep(3)
 
         actual_fmt = picam2.camera_configuration()['main']['format']
-        print(f"[CAM] Camera started OK — pixel format: {actual_fmt}")
+        print(f"[CAM] Camera started — pixel format: {actual_fmt}")
 
+        # Log AWB gains
         metadata = picam2.capture_metadata()
         if 'ColourGains' in metadata:
             rg, bg = metadata['ColourGains']
-            print(f"[CAM] AWB colour gains — Red: {rg:.2f}, Blue: {bg:.2f}")
+            print(f"[CAM] AWB gains — Red: {rg:.2f}, Blue: {bg:.2f}")
+
+        # Save a diagnostic frame so the user can verify colors
+        test = picam2.capture_array()
+        print(f"[CAM] Test frame shape: {test.shape}, dtype: {test.dtype}")
+        if test.ndim == 3:
+            means = [float(test[:,:,i].mean()) for i in range(min(test.shape[2], 3))]
+            print(f"[CAM] Channel means (should be roughly equal for neutral scene): {means}")
+        try:
+            cv2.imwrite("/tmp/cam_test.jpg", test)
+            print("[CAM] Diagnostic frame saved to /tmp/cam_test.jpg")
+        except:
+            pass
+
+def convert_frame(raw):
+    """Convert raw Picamera2 frame for OpenCV, rotated 180°.
+
+    With format='RGB888' in Picamera2 (DRM naming), the actual byte order
+    in memory is B,G,R — exactly what OpenCV expects.  No cvtColor needed.
+    Just rotate for the upside-down camera mount.
+    """
+    # Strip alpha/padding channel if present (safety fallback)
+    if raw.ndim == 3 and raw.shape[2] == 4:
+        raw = raw[:, :, :3]
+    # Rotate 180° because camera is mounted upside-down
+    return cv2.flip(raw, -1)
 
 def detect_with_boxes(frame):
-    """Run YOLOv8 inference and return state, confidence, and list of detections."""
+    """Run YOLOv8 inference and return state, confidence, and list of detections.
+    Fully vectorized post-processing for maximum speed on Raspberry Pi."""
     h, w = frame.shape[:2]
     blob = cv2.dnn.blobFromImage(frame, 1/255.0, (IMG_SIZE, IMG_SIZE),
                                   swapRB=True, crop=False)
     net.setInput(blob)
-    output = net.forward()
-    output = output[0].T
+    output = net.forward()[0].T  # shape: (num_detections, 6)
 
-    boxes, confidences, class_ids = [], [], []
+    # Vectorized: extract all class scores at once
+    all_scores = output[:, 4:]                          # (N, 2)
+    max_class_ids = np.argmax(all_scores, axis=1)       # (N,)
+    max_confidences = np.max(all_scores, axis=1)        # (N,)
+
+    # Filter by confidence threshold in one shot
+    mask = max_confidences > CONFIDENCE_THRESHOLD
+    if not np.any(mask):
+        return "none", 0, []
+
+    filtered_output = output[mask]
+    filtered_confs = max_confidences[mask]
+    filtered_ids = max_class_ids[mask]
+
+    # Vectorized box coordinate conversion
+    cx = filtered_output[:, 0]
+    cy = filtered_output[:, 1]
+    bw = filtered_output[:, 2]
+    bh = filtered_output[:, 3]
     x_scale = w / IMG_SIZE
     y_scale = h / IMG_SIZE
 
-    for detection in output:
-        cx, cy, bw, bh = detection[0], detection[1], detection[2], detection[3]
-        class_scores = detection[4:]
-        class_id = np.argmax(class_scores)
-        confidence = float(class_scores[class_id])
+    x1 = ((cx - bw / 2) * x_scale).astype(int)
+    y1 = ((cy - bh / 2) * y_scale).astype(int)
+    box_w = (bw * x_scale).astype(int)
+    box_h = (bh * y_scale).astype(int)
 
-        if confidence > CONFIDENCE_THRESHOLD:
-            x1 = int((cx - bw / 2) * x_scale)
-            y1 = int((cy - bh / 2) * y_scale)
-            box_w = int(bw * x_scale)
-            box_h = int(bh * y_scale)
-            boxes.append([x1, y1, box_w, box_h])
-            confidences.append(confidence)
-            class_ids.append(int(class_id))
+    boxes = np.column_stack([x1, y1, box_w, box_h]).tolist()
+    confidences = filtered_confs.tolist()
+    class_ids = filtered_ids.tolist()
 
     indices = cv2.dnn.NMSBoxes(boxes, confidences, CONFIDENCE_THRESHOLD, NMS_THRESHOLD)
 
@@ -173,7 +205,7 @@ def detect_with_boxes(frame):
     best_class = "none"
     detections = []
     if len(indices) > 0:
-        for i in np.array(indices).flatten():  # np.array() avoids crash on older/newer OpenCV
+        for i in indices.flatten():
             detections.append((boxes[i], confidences[i], class_ids[i]))
             if confidences[i] > best_conf and class_ids[i] < len(CLASS_NAMES):
                 best_conf = confidences[i]
@@ -181,19 +213,6 @@ def detect_with_boxes(frame):
 
     return best_class, best_conf, detections
 
-def convert_frame(raw):
-    """Convert Picamera2 RGB888 frame to BGR for OpenCV/JPEG encoding.
-
-    Camera outputs true RGB. OpenCV and cv2.imencode expect BGR —
-    without this conversion the channels are swapped in the MJPEG
-    stream, causing the pink/magenta tint.
-    """
-    # Strip alpha/padding channel if present
-    if raw.ndim == 3 and raw.shape[2] == 4:
-        raw = raw[:, :, :3]
-
-    # RGB → BGR so OpenCV encodes colours correctly
-    return cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
 
 def camera_loop():
     """Background thread: capture frames rapidly for smooth live stream."""
@@ -206,21 +225,8 @@ def camera_loop():
 
                 with frame_lock:
                     capture_frame = frame.copy()
-                    # Overlay the latest detection boxes onto the fresh frame
-                    disp = frame.copy()
-                    if trafficDetectionActive and latest_detections:
-                        for box, det_conf, cls_id in latest_detections:
-                            x, y, w, h = box
-                            if cls_id < len(CLASS_NAMES):
-                                label = f"{CLASS_NAMES[cls_id]} {det_conf:.2f}"
-                                color = COLORS.get(CLASS_NAMES[cls_id], (255, 255, 0))
-                            else:
-                                label = f"cls{cls_id} {det_conf:.2f}"
-                                color = (255, 255, 0)
-                            cv2.rectangle(disp, (x, y), (x + w, y + h), color, 2)
-                            cv2.putText(disp, label, (x, y - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                    display_frame = disp
+                    # ALWAYS update display_frame so the stream stays fast and smooth (20+ FPS)
+                    display_frame = frame.copy()
 
                 time.sleep(0.05)  # ~20 FPS capture
             except Exception as e:
@@ -231,7 +237,7 @@ def camera_loop():
 
 def detection_loop():
     """Background thread: run YOLO detection without freezing the stream."""
-    global trafficLightState, trafficLightConf, latest_detections
+    global trafficLightState, trafficLightConf, display_frame
     while True:
         if trafficDetectionActive and net is not None and capture_frame is not None:
             try:
@@ -248,9 +254,10 @@ def detection_loop():
                 elif state == "green":
                     print(f"[TF] GREEN detected ({conf:.2f}) — CAR CAN MOVE")
 
-                # Store detections — camera_loop will draw them on the next frame
+                # Update global detections so generate_stream can draw them instantly
+                # This decouples the slow AI from the fast video stream!
                 with frame_lock:
-                    latest_detections = detections
+                    current_detections = detections
 
             except Exception as e:
                 print(f"[TF] Detection error: {e}")
@@ -259,36 +266,46 @@ def detection_loop():
             time.sleep(0.5)
 
 def generate_stream():
-    """Generate MJPEG stream from display frame."""
+    """Generate MJPEG stream from display frame, drawing boxes on-the-fly."""
     while True:
         with frame_lock:
-            frame = display_frame
+            frame = display_frame.copy() if display_frame is not None else None
+            boxes_to_draw = list(current_detections)
 
         if frame is not None:
+            # Draw bounding boxes super fast so video stays smooth
+            if trafficDetectionActive:
+                for box, det_conf, cls_id in boxes_to_draw:
+                    x, y, w, h = box
+                    if cls_id < len(CLASS_NAMES):
+                        label = f"{CLASS_NAMES[cls_id]} {det_conf:.2f}"
+                        color = COLORS.get(CLASS_NAMES[cls_id], (255, 255, 0))
+                    else:
+                        label = f"cls{cls_id} {det_conf:.2f}"
+                        color = (255, 255, 0)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+            # Stream at 20-30 FPS, not capped by YOLO speed
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        time.sleep(0.15)
+        time.sleep(0.05)  # Stream much faster now (~20 FPS)
 
 def measure_ultrasonic():
-    """Fire one HC-SR04 pulse and return distance in mm.
-    Returns 9999 if the echo times out (nothing in range).
-    """
-    # Send 10 µs trigger pulse
-    GPIO.output(ULTRA_TRIG, GPIO.HIGH)
+    """Send a trigger pulse and measure echo time to get distance in mm."""
+    GPIO.output(ULTRA_TRIG, True)
     time.sleep(0.00001)
-    GPIO.output(ULTRA_TRIG, GPIO.LOW)
+    GPIO.output(ULTRA_TRIG, False)
 
-    # Wait for echo to go HIGH (start of return pulse)
-    timeout = time.time() + 0.04   # 40 ms max wait
+    timeout = time.time() + 0.04
     pulse_start = time.time()
     while GPIO.input(ULTRA_ECHO) == 0:
         pulse_start = time.time()
         if pulse_start > timeout:
             return 9999
 
-    # Wait for echo to go LOW (end of return pulse)
     timeout = time.time() + 0.04
     pulse_end = time.time()
     while GPIO.input(ULTRA_ECHO) == 1:
@@ -297,7 +314,7 @@ def measure_ultrasonic():
             return 9999
 
     pulse_duration = pulse_end - pulse_start
-    distance_mm = int(pulse_duration * 343000 / 2)  # speed of sound ÷ 2 (round-trip)
+    distance_mm = int(pulse_duration * 343000 / 2)
     return distance_mm
 
 def ultrasonic_loop():
@@ -310,13 +327,12 @@ def ultrasonic_loop():
                 dist = measure_ultrasonic()
                 read_count += 1
                 tofDistance = dist
-                # Log first 10 reads and then every 50th for debugging
                 if read_count <= 10 or read_count % 50 == 0:
                     print(f"[ULTRA] Read #{read_count}: {dist} mm")
             except Exception as e:
                 print(f"[ULTRA] Read error: {e}")
                 tofDistance = 9999
-            time.sleep(0.1)   # ~10 Hz — fast enough, avoids echo overlap
+            time.sleep(0.1)
         else:
             tofDistance = 9999
             time.sleep(0.5)
@@ -348,9 +364,9 @@ def drive(lp, rp):
         GPIO.output(IN3, GPIO.LOW)
         GPIO.output(IN4, GPIO.LOW)
 
-    pwmA.ChangeDutyCycle(abs(lp))
-    pwmB.ChangeDutyCycle(abs(rp) * RIGHT_MOTOR_SCALE)
-
+    # Apply calibration on LEFT motor only
+    pwmA.ChangeDutyCycle(abs(lp) * LEFT_MOTOR_SCALE)
+    pwmB.ChangeDutyCycle(abs(rp))
 # ================= WEB UI =================
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -385,6 +401,7 @@ canvas{
     flex-direction: column;
     align-items: center;
     min-width: 180px;
+    margin-top: -10vh; /* Move the controller block higher */
 }
 .center-header {
     color: cyan;
@@ -442,7 +459,7 @@ input:checked + .slider:before { transform: translateX(21px); }
 }
 .cam-preview img {
     width: 100%;
-    max-width: 220px;
+    max-width: 440px; /* Doubled the size of the camera preview */
     border-radius: 8px;
     border: 1px solid cyan;
 }
@@ -721,18 +738,18 @@ def speed_api():
 
 @app.route('/tof_obstacle')
 def tof_obstacle_api():
-    """Toggle ToF obstacle detection ON/OFF."""
+    """Toggle obstacle detection ON/OFF."""
     global tofObstacleDetection
     tofObstacleDetection = request.args.get('active') == 'true'
     if tofObstacleDetection:
-        print("[TOF] Obstacle detection ENABLED")
+        print("[ULTRA] Obstacle detection ENABLED")
     else:
-        print("[TOF] Obstacle detection DISABLED")
+        print("[ULTRA] Obstacle detection DISABLED")
     return "OK"
 
 @app.route('/tof_state')
 def tof_state_api():
-    """Return current ToF sensor state as JSON."""
+    """Return current sensor state as JSON."""
     import json
     obstacle = tofObstacleDetection and (tofDistance < TOF_STOP_DISTANCE)
     return json.dumps({
@@ -786,32 +803,8 @@ def video():
 
 # ================= MAIN LOOP =================
 def loop():
-    global red_stop_until, red_already_triggered
     while True:
         now = time.time()
-
-        # --- Red-light logic: stop for 3 s then resume controller ---
-        if trafficDetectionActive and trafficLightState == "red":
-            if not red_already_triggered:
-                # First moment red is seen → start 3-second stop
-                red_stop_until = now + 3
-                red_already_triggered = True
-                print("[TF] RED detected — stopping for 3 seconds")
-        else:
-            # Red is no longer detected → reset so it can trigger again next time
-            red_already_triggered = False
-
-        # While inside the 3-second red-stop window → hold car still
-        if now < red_stop_until:
-            drive(0, 0)
-            time.sleep(0.02)
-            continue
-
-        # If ToF obstacle detection is ON and obstacle too close → force stop
-        if tofObstacleDetection and tofDistance < TOF_STOP_DISTANCE:
-            drive(0, 0)
-            time.sleep(0.02)
-            continue
 
         # Normal driving — cap actual power at 80 % of slider value
         # Camera/sensor face backward, so negate both axes so
@@ -820,6 +813,17 @@ def loop():
         effectiveSpeed = currentSpeed * 0.80
         throttle = (-joystickThrottle * effectiveSpeed) / 100
         steering = (joystickSteering * effectiveSpeed) / 100
+
+        # RED LIGHT → block FORWARD only (left, right, backward still work)
+        if trafficDetectionActive and trafficLightState == "red":
+            if throttle < 0:        # negative throttle = forward motion
+                throttle = 0        # block forward, keep reverse & steering
+
+        # ULTRASONIC obstacle → block FORWARD only (reverse/steer still work)
+        if tofObstacleDetection and tofDistance < TOF_STOP_DISTANCE:
+            if throttle < 0:        # negative throttle = forward motion
+                throttle = 0        # block forward, keep reverse & steering
+
         lp = throttle - steering
         rp = throttle + steering
         drive(lp, rp)
@@ -841,12 +845,12 @@ if __name__ == "__main__":
     det_thread = threading.Thread(target=detection_loop, daemon=True)
     det_thread.start()
 
-    # Start ultrasonic sensor reading loop
-    tof_thread = threading.Thread(target=ultrasonic_loop, daemon=True)
-    tof_thread.start()
+    # Start ultrasonic reading loop
+    ultra_thread = threading.Thread(target=ultrasonic_loop, daemon=True)
+    ultra_thread.start()
 
     print("=" * 50)
-    print("  RC Car AI — Traffic Light + HC-SR04 Ultrasonic")
+    print("  RC Car AI — Traffic Light + Ultrasonic Sensor")
     print("=" * 50)
     print("Control: http://0.0.0.0:5000/")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
